@@ -117,6 +117,9 @@ namespace android {
     #define appendPrintBuf(x...)
 #endif
 
+#define MAX_RIL_SOL     RIL_REQUEST_SET_UNSOL_CELL_INFO_LIST_RATE
+#define MAX_RIL_UNSOL   RIL_UNSOL_CELL_INFO_LIST
+
 enum WakeType {DONT_WAKE, WAKE_PARTIAL};
 
 typedef struct {
@@ -221,6 +224,7 @@ static void dispatchCdmaBrSmsCnf(Parcel &p, RequestInfo *pRI);
 static void dispatchRilCdmaSmsWriteArgs(Parcel &p, RequestInfo *pRI);
 static void dispatchUiccSubscripton(Parcel &p, RequestInfo *pRI);
 static int responseInts(Parcel &p, void *response, size_t responselen);
+static int responseIntsGetPreferredNetworkType(Parcel &p, void *response, size_t responselen);
 static int responseStrings(Parcel &p, void *response, size_t responselen);
 static int responseStringsNetworks(Parcel &p, void *response, size_t responselen);
 static int responseStrings(Parcel &p, void *response, size_t responselen, bool network_search);
@@ -347,13 +351,22 @@ void   nullParcelReleaseFunction (const uint8_t* data, size_t dataSize,
 static void
 issueLocalRequest(int request, void *data, int len) {
     RequestInfo *pRI;
+    int index;
     int ret;
 
     pRI = (RequestInfo *)calloc(1, sizeof(RequestInfo));
 
     pRI->local = 1;
     pRI->token = 0xffffffff;        // token is not used in this context
-    pRI->pCI = &(s_commands[request]);
+
+    /* Hack to include Samsung requests */
+    if (request > 10000) {
+        index = request - 10000 + MAX_RIL_SOL;
+        RLOGD("SAMSUNG: request=%d, index=%d", request, index);
+        pRI->pCI = &(s_commands[index]);
+    } else {
+        pRI->pCI = &(s_commands[request]);
+    }
 
     ret = pthread_mutex_lock(&s_pendingRequestsMutex);
     assert (ret == 0);
@@ -378,6 +391,7 @@ processCommandBuffer(void *buffer, size_t buflen) {
     int32_t request;
     int32_t token;
     RequestInfo *pRI;
+    int index;
     int ret;
 
     p.setData((uint8_t *) buffer, buflen);
@@ -391,7 +405,10 @@ processCommandBuffer(void *buffer, size_t buflen) {
         return 0;
     }
 
-    if (request < 1 || request >= (int32_t)NUM_ELEMS(s_commands)) {
+    /* Hack to include Samsung requests */
+    if (request < 1 || ((request > MAX_RIL_SOL) &&
+            (request < RIL_REQUEST_GET_CELL_BROADCAST_CONFIG)) ||
+            request > RIL_REQUEST_HANGUP_VT) {
         RLOGE("unsupported request code %d token %d", request, token);
         // FIXME this should perhaps return a response
         return 0;
@@ -401,7 +418,16 @@ processCommandBuffer(void *buffer, size_t buflen) {
     pRI = (RequestInfo *)calloc(1, sizeof(RequestInfo));
 
     pRI->token = token;
-    pRI->pCI = &(s_commands[request]);
+
+    /* Hack to include Samsung requests */
+    if (request > 10000) {
+        index = request - 10000 + MAX_RIL_SOL;
+        RLOGD("processCommandBuffer: samsung request=%d, index=%d",
+                request, index);
+        pRI->pCI = &(s_commands[index]);
+    } else {
+        pRI->pCI = &(s_commands[request]);
+    }
 
     ret = pthread_mutex_lock(&s_pendingRequestsMutex);
     assert (ret == 0);
@@ -1611,6 +1637,41 @@ blockingWrite(int fd, const void *buffer, size_t len) {
 }
 
 static int
+responseIntsGetPreferredNetworkType(Parcel &p, void *response, size_t responselen) {
+    int numInts;
+
+    if (response == NULL && responselen != 0) {
+        RLOGE("invalid response: NULL");
+        return RIL_ERRNO_INVALID_RESPONSE;
+    }
+    if (responselen % sizeof(int) != 0) {
+        RLOGE("invalid response length %d expected multiple of %d\n",
+            (int)responselen, (int)sizeof(int));
+        return RIL_ERRNO_INVALID_RESPONSE;
+    }
+
+    int *p_int = (int *) response;
+
+    numInts = responselen / sizeof(int *);
+    p.writeInt32 (numInts);
+
+    /* each int*/
+    startResponse;
+    for (int i = 0 ; i < numInts ; i++) {
+        if (i == 0 && p_int[0] == 7) {
+            RLOGD("REQUEST_GET_PREFERRED_NETWORK_TYPE: NETWORK_MODE_GLOBAL => NETWORK_MODE_WCDMA_PREF");
+            p_int[0] = 0;
+        }
+        appendPrintBuf("%s%d,", printBuf, p_int[i]);
+        p.writeInt32(p_int[i]);
+    }
+    removeLastChar;
+    closeResponse;
+
+    return 0;
+}
+
+static int
 sendResponseRaw (const void *data, size_t dataSize) {
     int fd = s_fdCommand;
     int ret;
@@ -1703,7 +1764,46 @@ static int responseStrings(Parcel &p, void *response, size_t responselen) {
 }
 
 static int responseStringsNetworks(Parcel &p, void *response, size_t responselen) {
-    return responseStrings(p, response, responselen, true);
+    int numStrings;
+    int inQANElements = 5;
+    int outQANElements = 4;
+
+    if (response == NULL && responselen != 0) {
+        RLOGE("invalid response: NULL");
+        return RIL_ERRNO_INVALID_RESPONSE;
+    }
+    if (responselen % sizeof(char *) != 0) {
+        RLOGE("invalid response length %d expected multiple of %d\n",
+            (int)responselen, (int)sizeof(char *));
+        return RIL_ERRNO_INVALID_RESPONSE;
+    }
+
+    if (response == NULL) {
+        p.writeInt32 (0);
+    } else {
+        char **p_cur = (char **) response;
+        int j = 0;
+
+        numStrings = responselen / sizeof(char *);
+        p.writeInt32 ((numStrings / inQANElements) * outQANElements);
+
+        /* each string*/
+        startResponse;
+        for (int i = 0 ; i < numStrings ; i++) {
+            /* Samsung is sending 5 elements, upper layer expects 4.
+               Drop every 5th element here */
+            if (j == outQANElements) {
+                j = 0;
+            } else {
+                appendPrintBuf("%s%s,", printBuf, (char*)p_cur[i]);
+                writeStringToParcel (p, p_cur[i]);
+                j++;
+            }
+        }
+        removeLastChar;
+        closeResponse;
+    }
+    return 0;
 }
 
 /** response is a char **, pointing to an array of char *'s */
@@ -2307,6 +2407,11 @@ static int responseCdmaInformationRecords(Parcel &p,
 
 static int responseRilSignalStrength(Parcel &p,
                     void *response, size_t responselen) {
+
+    int gsmSignalStrength;
+    int cdmaDbm;
+    int evdoDbm;
+
     if (response == NULL && responselen != 0) {
         RLOGE("invalid response: NULL");
         return RIL_ERRNO_INVALID_RESPONSE;
@@ -2315,13 +2420,51 @@ static int responseRilSignalStrength(Parcel &p,
     if (responselen >= sizeof (RIL_SignalStrength_v5)) {
         RIL_SignalStrength_v7 *p_cur = ((RIL_SignalStrength_v7 *) response);
 
-        p.writeInt32(p_cur->GW_SignalStrength.signalStrength);
+        /* gsmSignalStrength */
+        RLOGD("gsmSignalStrength (raw)=%d", p_cur->GW_SignalStrength.signalStrength);
+        gsmSignalStrength = p_cur->GW_SignalStrength.signalStrength & 0xFF;
+        if (gsmSignalStrength < 0) {
+            gsmSignalStrength = 99;
+        } else if (gsmSignalStrength > 31 && gsmSignalStrength != 99) {
+            gsmSignalStrength = 31;
+        }
+        RLOGD("gsmSignalStrength (corrected)=%d", gsmSignalStrength);
+        p.writeInt32(gsmSignalStrength);
+
+        /* gsmBitErrorRate */
         p.writeInt32(p_cur->GW_SignalStrength.bitErrorRate);
-        p.writeInt32(p_cur->CDMA_SignalStrength.dbm);
+
+        /* cdmaDbm */
+        RLOGD("cdmaDbm (raw)=%d", p_cur->CDMA_SignalStrength.dbm);
+        cdmaDbm = p_cur->CDMA_SignalStrength.dbm & 0xFF;
+        if (cdmaDbm < 0) {
+            cdmaDbm = 99;
+        } else if (cdmaDbm > 31 && cdmaDbm != 99) {
+            cdmaDbm = 31;
+        }
+        //RLOGD("cdmaDbm (corrected)=%d", cdmaDbm);
+        p.writeInt32(cdmaDbm);
+
+        /* cdmaEcio */
         p.writeInt32(p_cur->CDMA_SignalStrength.ecio);
-        p.writeInt32(p_cur->EVDO_SignalStrength.dbm);
+
+        /* evdoDbm */
+        RLOGD("evdoDbm (raw)=%d", p_cur->EVDO_SignalStrength.dbm);
+        evdoDbm = p_cur->EVDO_SignalStrength.dbm & 0xFF;
+        if (evdoDbm < 0) {
+            evdoDbm = 99;
+        } else if (evdoDbm > 31 && evdoDbm != 99) {
+            evdoDbm = 31;
+        }
+        //RLOGD("evdoDbm (corrected)=%d", evdoDbm);
+        p.writeInt32(evdoDbm);
+
+        /* evdoEcio */
         p.writeInt32(p_cur->EVDO_SignalStrength.ecio);
+
+        /* evdoSnr */
         p.writeInt32(p_cur->EVDO_SignalStrength.signalNoiseRatio);
+
         if (responselen >= sizeof (RIL_SignalStrength_v6)) {
             /*
              * Fixup LTE for backwards compatibility
@@ -2376,11 +2519,11 @@ static int responseRilSignalStrength(Parcel &p,
                 LTE_SS.signalStrength=%d,LTE_SS.rsrp=%d,LTE_SS.rsrq=%d,\
                 LTE_SS.rssnr=%d,LTE_SS.cqi=%d]",
                 printBuf,
-                p_cur->GW_SignalStrength.signalStrength,
+                gsmSignalStrength,
                 p_cur->GW_SignalStrength.bitErrorRate,
-                p_cur->CDMA_SignalStrength.dbm,
+                cdmaDbm,
                 p_cur->CDMA_SignalStrength.ecio,
-                p_cur->EVDO_SignalStrength.dbm,
+                evdoDbm,
                 p_cur->EVDO_SignalStrength.ecio,
                 p_cur->EVDO_SignalStrength.signalNoiseRatio,
                 p_cur->LTE_SignalStrength.signalStrength,
@@ -3423,8 +3566,14 @@ RIL_register (const RIL_RadioFunctions *callbacks) {
     }
 
     for (int i = 0; i < (int)NUM_ELEMS(s_unsolResponses); i++) {
-        assert(i + RIL_UNSOL_RESPONSE_BASE
+        /* Hack to include Samsung responses */
+        if (i > MAX_RIL_UNSOL - RIL_UNSOL_RESPONSE_BASE) {
+            assert(i + SAMSUNG_UNSOL_RESPONSE_BASE - MAX_RIL_UNSOL
                 == s_unsolResponses[i].requestNumber);
+        } else {
+            assert(i + RIL_UNSOL_RESPONSE_BASE
+                 == s_unsolResponses[i].requestNumber);
+        }
     }
 
     // New rild impl calls RIL_startEventLoop() first
@@ -3750,7 +3899,13 @@ void RIL_onUnsolicitedResponse(int unsolResponse, void *data,
         return;
     }
 
-    unsolResponseIndex = unsolResponse - RIL_UNSOL_RESPONSE_BASE;
+    /* Hack to include Samsung responses */
+    if (unsolResponse > SAMSUNG_UNSOL_RESPONSE_BASE) {
+        unsolResponseIndex = unsolResponse - SAMSUNG_UNSOL_RESPONSE_BASE + MAX_RIL_UNSOL - RIL_UNSOL_RESPONSE_BASE;
+        RLOGD("SAMSUNG: unsolResponse=%d, unsolResponseIndex=%d", unsolResponse, unsolResponseIndex);
+    } else {
+        unsolResponseIndex = unsolResponse - RIL_UNSOL_RESPONSE_BASE;
+    }
 
     if ((unsolResponseIndex < 0)
         || (unsolResponseIndex >= (int32_t)NUM_ELEMS(s_unsolResponses))) {
@@ -3974,6 +4129,7 @@ requestToString(int request) {
         case RIL_REQUEST_ENTER_DEPERSONALIZATION_CODE: return "ENTER_DEPERSONALIZATION_CODE";
         case RIL_REQUEST_GET_CURRENT_CALLS: return "GET_CURRENT_CALLS";
         case RIL_REQUEST_DIAL: return "DIAL";
+        case RIL_REQUEST_DIAL_EMERGENCY: return "DIAL";
         case RIL_REQUEST_GET_IMSI: return "GET_IMSI";
         case RIL_REQUEST_HANGUP: return "HANGUP";
         case RIL_REQUEST_HANGUP_WAITING_OR_BACKGROUND: return "HANGUP_WAITING_OR_BACKGROUND";
@@ -4122,6 +4278,7 @@ requestToString(int request) {
         case RIL_UNSOL_RESPONSE_IMS_NETWORK_STATE_CHANGED: return "RESPONSE_IMS_NETWORK_STATE_CHANGED";
         case RIL_UNSOL_RESPONSE_TETHERED_MODE_STATE_CHANGED: return "RIL_UNSOL_RESPONSE_TETHERED_MODE_STATE_CHANGED";
         case RIL_UNSOL_UICC_SUBSCRIPTION_STATUS_CHANGED: return "UNSOL_UICC_SUBSCRIPTION_STATUS_CHANGED";
+        case RIL_UNSOL_STK_SEND_SMS_RESULT: return "RIL_UNSOL_STK_SEND_SMS_RESULT";
         default: return "<unknown request>";
     }
 }
